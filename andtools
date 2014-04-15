@@ -1,0 +1,263 @@
+#! /usr/bin/env python
+
+import sys, os, re
+
+try:
+	import urwid
+except ImportError:
+	print """--- ERROR ---
+You need the urwid library for python installed, e.g.:
+
+* Debian/Ubuntu: sudo apt-get install python-urwid
+* Gentoo: sudo emerge dev-python/urwid
+
+Also check https://github.com/wardi/urwid/wiki/Installation-instructions for instructions."""
+	sys.exit(1)
+
+try:
+	import pyadb
+except ImportError:
+	print """--- ERROR ---
+You need the pyadb module installed, e.g.:
+
+* sudo pip install pyadb
+
+Also check https://github.com/sch3m4/pyadb for instructions"""
+	sys.exit(1)
+
+PALETTE = [
+	('bold', 'bold', ''),
+	('menu', urwid.YELLOW + ',bold', ''),
+	('reversed', 'standout', ''),
+	('error', '%s,%s' % (urwid.WHITE, 'bold'), urwid.DARK_RED)
+]
+
+MODULES = [
+	('List Apps', 'AppModule'),
+]
+
+def ScrollableText(text):
+	lines = [urwid.Text(l.rstrip()) for l in text.split('\n')]
+	return urwid.ListBox(lines)
+
+class MainWindow:
+	def __init__(self):
+
+		# SetUp UI
+		self.clean_exit = False
+		self.frame = urwid.Frame(urwid.SolidFill(u'/'), header=self.header(), footer=self.footer())
+		loop = urwid.MainLoop(urwid.LineBox(self.frame), PALETTE, unhandled_input=self.handle_keys)
+
+		# Start adb
+		if self.start_adb():
+			self.refresh_devices()
+			self.show_main()
+
+		# Run loop
+		while self.clean_exit != True:
+			try:
+				loop.run()
+			except:
+				self.show_main()
+				error, devs = self.adb.get_devices()
+				if error == 1 or len(devs) == 0:
+					self.set_status('You need to connect a device and hit F8 to refresh.', True)
+
+	def start_adb(self):
+		adb = os.getenv('ANDROID_HOME')
+		if not adb:
+			self.no_adb()
+			return False
+		else:
+			self.adb = pyadb.ADB()
+			adbpath = os.path.abspath(os.path.join(adb, 'platform-tools', 'adb'))
+			self.adb.set_adb_path(adbpath)
+			if not self.adb.check_path():
+				self.no_adb()
+				return False
+			else:
+				self.status.set_text(u'ADB version: %s' % self.adb.get_version())
+
+		return True
+
+	def no_adb(self):
+		"""
+			Show warning dialog, that no adb could be found.
+			Pressing any button will exit the program.
+		"""
+		self.no_adb = True
+		text = urwid.Text(u'Could not find adb.\nPlease make sure ANDROID_HOME points to the right directory.', 'center')
+		box = urwid.AttrMap(urwid.LineBox(text), 'error')
+		self.show_content(urwid.Filler(box, 'middle'))
+
+	def header(self):
+		title = urwid.Padding(urwid.Text([('bold', u'ANDTOOLS'), u' by Tim Roes']))
+		header = urwid.Pile([title, 
+			urwid.Text(('menu', u'Back (Esc) | Switch device (F8) | Quit (F10)')),
+			urwid.Divider(u'\u2500')])
+		return urwid.AttrMap(header, 'header')
+
+	def footer(self):
+		self.status = urwid.Text('')
+		return urwid.Pile([urwid.Divider(u'\u2500'), self.status])
+
+	def show_main(self):
+		self.module = None
+		body = [urwid.Text(('bold', u'Select an action:')),urwid.Divider()]
+
+		for m in MODULES:
+			button = urwid.Button(m[0])
+			urwid.connect_signal(button, 'click', self.select_action, m)
+			body.append(urwid.AttrMap(button, None, focus_map='reversed'))
+
+		self.show_content(urwid.ListBox(urwid.SimpleFocusListWalker(body)))
+
+	def select_action(self, button, choice):
+		clazz = getattr(sys.modules[__name__], choice[1])
+		handler = {
+			"set_status": self.set_status,
+			"set_view": self.show_content,
+			"adb": self.adb
+		}
+		self.module = clazz(handler)
+
+	def handle_keys(self, key):
+		if self.no_adb == True or key == 'f10':
+			self.exit(None)
+		elif key == 'f8':
+			old = self.adb.get_target_device()
+			self.refresh_devices()
+			# If the device actually changed, go back to main screen
+			if self.adb.get_target_device() != old:
+				self.show_main()
+		elif key == 'esc':
+			# If no back method exists or it returns True
+			# show main screen again.
+			try:
+				if self.module.back():
+					self.show_main()
+			except AttributeError:
+				self.show_main()
+		else:
+			try:
+				self.module.handle_keys(key)
+			except AttributeError:
+				pass
+
+	def exit(self, unused):
+		self.clean_exit = True
+		raise urwid.ExitMainLoop()
+
+	def set_status(self, msg, error=False):
+		self.status.set_text(('error', msg) if error else msg)
+
+	def show_content(self, view):
+		self.frame.contents['body'] = (view, None)
+
+	def refresh_devices(self):
+		error,devs = self.adb.get_devices()
+		if error == 1 or len(devs) == 0:
+			self.set_status(u'No devices conntected. Refresh with F8')
+		elif error == 2:
+			self.set_status(u'You don\'t have enough permissions.', True)
+		elif error == 0:
+			current_dev = self.adb.get_target_device()
+			try:
+				i = devs.index(current_dev)
+			except ValueError:
+				i = -1
+
+			new_index = (i + 1) % len(devs)
+			self.set_device(devs[new_index])
+
+	def set_device(self, devid):
+		self.adb.set_target_device(devid)
+		self.adb.run_cmd('devices -l')
+		devinfo = self.adb.get_output()
+		match = re.search(r'(' + devid + ')\s+.*model:(\S+)', devinfo)
+		if not match or not match.group(2):
+			devname = devid
+		else:
+			devname = '%s (%s)' % (match.group(2), devid)
+		self.set_status(u'Using: %s' % devname)
+
+
+
+class AppModule:
+	"""
+		Module that lists all installed apps and offers actions on the apps.
+		Currently showing information and downloading apk's is supported.
+	"""
+	def __init__(self, handler):
+		self.handler = handler
+		self.adb = handler['adb']
+		self.APP_ACTIONS = [
+			('Show informations', self.show_details, 'f5'),
+			('Download Apk', self.download_apk, 'f6')
+		]
+		self.list_apps()
+
+	def list_apps(self):
+		self.up = None
+
+		body = [urwid.Text(('bold', u'Select an App for further actions:')), urwid.Divider()]
+
+		applist = self.adb.shell_command('pm list packages -f')
+		apps = re.findall(r'package:([^=]+)=(\S*)', applist)
+
+		for a in apps:
+			button = urwid.Button(a[1])
+			urwid.connect_signal(button, 'click', self.select_app, a)
+			body.append(urwid.AttrMap(button, None, focus_map='reversed'))
+
+		self.handler['set_view'](urwid.ListBox(urwid.SimpleFocusListWalker(body)))
+
+	def select_app(self, button, app):
+		self.app = app
+		self.show_app()
+
+	def show_app(self):
+		self.up = self.list_apps
+		
+		body = [
+			urwid.Text(('bold', self.app[1])),
+			urwid.Divider()
+		]
+
+		for a in self.APP_ACTIONS:
+			button = urwid.Button('%s (%s)' % (a[0], a[2].upper()))
+			urwid.connect_signal(button, 'click', a[1])
+			body.append(urwid.AttrMap(button, None, focus_map='reversed'))
+
+		self.handler['set_view'](urwid.ListBox(urwid.SimpleFocusListWalker(body)))
+
+
+	def show_details(self, button=None):
+		self.up = self.show_app
+
+		details = self.adb.shell_command('dumpsys package %s' % self.app[1])
+
+		self.handler['set_view'](ScrollableText(details))
+
+
+	def download_apk(self, button=None):
+		self.handler['set_status'](u'Downloading %s' % self.app[0])
+		self.adb.get_remote_file(self.app[0], '.')
+		self.handler['set_status'](u'Finished downloading %s' % self.app[0])
+
+	def handle_keys(self, key):
+		if self.up == self.list_apps:
+			for a in self.APP_ACTIONS:
+				if a[2] == key:
+					a[1]()
+			
+
+	def back(self):
+		if self.up:
+			self.up()
+		else:
+			return True
+
+
+if __name__ == "__main__":
+	MainWindow()
